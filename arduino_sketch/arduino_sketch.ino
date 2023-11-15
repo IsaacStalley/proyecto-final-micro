@@ -6,10 +6,10 @@
 #define TARGET_WIDTH 28
 #define TARGET_HEIGHT 28
 
-unsigned short pixels[ORIGINAL_WIDTH * ORIGINAL_HEIGHT]; // QQVGA: 160x120 X 16 bytes per pixel (RGB565)
-unsigned short cropped_pixels[ORIGINAL_HEIGHT * ORIGINAL_HEIGHT]; // 120x120
-unsigned short resized_pixels[TARGET_WIDTH*TARGET_HEIGHT]; // 28x28
-unsigned char greyscale_pixels[TARGET_WIDTH * TARGET_HEIGHT];
+uint16_t pixels[ORIGINAL_WIDTH * ORIGINAL_HEIGHT]; // QQVGA: 160x120 X 16 bytes per pixel (RGB565)
+uint16_t greyscale_pixels[ORIGINAL_WIDTH * ORIGINAL_HEIGHT];
+uint16_t cropped_pixels[ORIGINAL_HEIGHT * ORIGINAL_HEIGHT]; // 120x120
+uint16_t resized_pixels[TARGET_WIDTH*TARGET_HEIGHT]; // 28x28
 float normalized_pixels[TARGET_WIDTH * TARGET_HEIGHT];
 
 void setup() {
@@ -37,7 +37,7 @@ void setup() {
   Serial.println();
 }
 
-void cropImage(unsigned short *original, unsigned short *cropped) {
+void cropImage(uint16_t *original, uint16_t *cropped) {
   // Calculate the cropping bounds
   int cropStartX = (ORIGINAL_WIDTH - ORIGINAL_HEIGHT) / 2;
   int cropEndX = cropStartX + ORIGINAL_HEIGHT;
@@ -52,7 +52,7 @@ void cropImage(unsigned short *original, unsigned short *cropped) {
   }
 }
 
-void resizeImage(unsigned short *original, unsigned short *resized) {
+void resizeImage(uint16_t *original, uint16_t *resized) {
   float x_ratio = (float)ORIGINAL_HEIGHT / TARGET_WIDTH;
   float y_ratio = (float)ORIGINAL_HEIGHT / TARGET_HEIGHT;
 
@@ -69,29 +69,27 @@ void resizeImage(unsigned short *original, unsigned short *resized) {
   }
 }
 
-void rgb565ToGreyscale(const unsigned short *rgb565Image, unsigned char *greyscaleImage) {
+void rgb565ToGreyscale(const uint16_t *rgb565Image, uint16_t *greyscaleImage) {
   for (int i = 0; i < ORIGINAL_WIDTH * ORIGINAL_HEIGHT; i++) {
-    unsigned short pixel = rgb565Image[i];
+    uint16_t pixel = rgb565Image[i];
 
     // Extract individual color components
-    unsigned short red = (pixel >> 11) & 0x1F;
-    unsigned short green = (pixel >> 5) & 0x3F;
-    unsigned short blue = pixel & 0x1F;
-
-    // Convert to greyscale using luminosity method
-    unsigned char greyscale = (unsigned char)(0.299 * red + 0.587 * green + 0.114 * blue);
-
+    uint16_t red = ((pixel >> 11) & 0x1f) << 3;
+    uint16_t green = ((pixel >> 5) & 0x3f) << 2;
+    uint16_t blue = (pixel & 0x1f) << 3;
+    uint16_t greyscale = ((0.2126 * red) + (0.7152 * green) + (0.0722 * blue));
+    
     greyscaleImage[i] = greyscale;
   }
 }
 
-void normalizeImage(unsigned char *greyscaleImage, float *normalizedImage) {
+void normalizeImage(uint16_t *greyscaleImage, float *normalizedImage) {
   for (int i = 0; i < TARGET_WIDTH * TARGET_HEIGHT; i++) {
     normalizedImage[i] = greyscaleImage[i] / 255.0f;
   }
 }
 
-void displayImageOnSerial(const unsigned char *image, int width, int height) {
+void displayImageOnSerial(uint16_t *image, int width, int height) {
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             // Print a character based on pixel intensity
@@ -146,7 +144,7 @@ int ei_camera_cutout_get_data(size_t offset, size_t length, float *out_ptr) {
     return 0;
 }
 
-void predict(float *normalizedImage) {
+void predict() {
   // summary of inferencing settings (from model_metadata.h)
   ei_printf("Inferencing settings:\n");
   ei_printf("\tImage resolution: %dx%d\n", EI_CLASSIFIER_INPUT_WIDTH, EI_CLASSIFIER_INPUT_HEIGHT);
@@ -155,7 +153,7 @@ void predict(float *normalizedImage) {
 
   ei::signal_t signal;
   signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
-  signal.get_data = &ei_camera_cutout_get_data;
+  signal.get_data = &get_prediction_data;
 
   // run the impulse: DSP, neural network and the Anomaly algorithm
   ei_impulse_result_t result = { 0 };
@@ -180,20 +178,20 @@ void loop() {
     Serial.println("Reading frame");
     Serial.println();
     Camera.readFrame(pixels);
-    cropImage(pixels, cropped_pixels);
+    rgb565ToGreyscale(pixels, greyscale_pixels);
+    cropImage(greyscale_pixels, cropped_pixels);
     resizeImage(cropped_pixels, resized_pixels);
-    rgb565ToGreyscale(resized_pixels, greyscale_pixels);
-    normalizeImage(greyscale_pixels, normalized_pixels);
+    normalizeImage(resized_pixels, normalized_pixels);
 
     int numPixels = TARGET_WIDTH * TARGET_HEIGHT;
 
     for (int i = 0; i < numPixels; i++) {
-      float p = normalized_pixels[i];
+      uint16_t p = resized_pixels[i];
 
-      //Serial.print(p, 4);  // Print with four decimal places
-      //Serial.print(' ');
+      Serial.print(p);  // Print with four decimal places
+      Serial.print(' ');
     }
-    displayImageOnSerial(greyscale_pixels, TARGET_WIDTH, TARGET_HEIGHT);
-    predict(normalized_pixels);
+    displayImageOnSerial(resized_pixels, TARGET_WIDTH, TARGET_HEIGHT);
+    predict();
   }
 }
