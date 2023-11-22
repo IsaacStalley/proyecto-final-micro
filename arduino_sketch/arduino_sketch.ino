@@ -1,16 +1,18 @@
+
 #include <minist-keras-model_inferencing.h>
 #include <Arduino_OV767X.h>
 
-#define ORIGINAL_WIDTH 160
-#define ORIGINAL_HEIGHT 120
+#define ORIGINAL_WIDTH 176
+#define ORIGINAL_HEIGHT 144
 #define TARGET_WIDTH 28
 #define TARGET_HEIGHT 28
+#define UPPER_CONTRAST 128
 
-uint16_t pixels[ORIGINAL_WIDTH * ORIGINAL_HEIGHT]; // QQVGA: 160x120 X 16 bytes per pixel (RGB565)
-uint16_t greyscale_pixels[ORIGINAL_WIDTH * ORIGINAL_HEIGHT];
-uint16_t cropped_pixels[ORIGINAL_HEIGHT * ORIGINAL_HEIGHT]; // 120x120
-uint16_t resized_pixels[TARGET_WIDTH*TARGET_HEIGHT]; // 28x28
+uint16_t pixels[ORIGINAL_WIDTH * ORIGINAL_HEIGHT]; // QQVGA: 160x120 X 2 bytes per pixel (RGB565)
+uint8_t greyscale_pixels[ORIGINAL_WIDTH * ORIGINAL_HEIGHT];
+uint8_t resized_pixels[TARGET_WIDTH*TARGET_HEIGHT]; // 28x28
 float normalized_pixels[TARGET_WIDTH * TARGET_HEIGHT];
+int bytesPerFrame;
 
 void setup() {
   Serial.begin(9600);
@@ -19,7 +21,7 @@ void setup() {
   Serial.println("OV767X Camera Capture");
   Serial.println();
 
-  if (!Camera.begin(QQVGA, RGB565, 1)) {
+  if (!Camera.begin(QCIF, RGB565, 1)) {
     Serial.println("Failed to initialize camera!");
     while (1);
   }
@@ -32,64 +34,157 @@ void setup() {
   Serial.print("\tbits per pixel = ");
   Serial.println(Camera.bitsPerPixel());
   Serial.println();
-
+  bytesPerFrame = Camera.width() * Camera.height() * Camera.bytesPerPixel();
   Serial.println("Send the 'c' character to read a frame ...");
   Serial.println();
 }
 
-void cropImage(uint16_t *original, uint16_t *cropped) {
-  // Calculate the cropping bounds
-  int cropStartX = (ORIGINAL_WIDTH - ORIGINAL_HEIGHT) / 2;
-  int cropEndX = cropStartX + ORIGINAL_HEIGHT;
+void scaleAndCenter(uint8_t* inputNumber, uint8_t* outputNumber, int boundingBoxWidth, int boundingBoxHeight) {
+  // Constants for the target dimensions
+  const int targetHeight = 20;
+  float xy_ratio = (float)boundingBoxWidth / boundingBoxHeight;
+  const int targetWidth = targetHeight*xy_ratio + targetHeight*0.2f;
 
-  // Crop the center region
-  for (int y = 0; y < ORIGINAL_HEIGHT; y++) {
-    for (int x = 0; x < ORIGINAL_HEIGHT; x++) {
-      int originalIndex = (y * ORIGINAL_WIDTH) + (x + cropStartX);
-      int croppedIndex = y * ORIGINAL_HEIGHT + x;
-      cropped[croppedIndex] = original[originalIndex];
-    }
+  float y_ratio = (float)boundingBoxHeight / targetHeight;
+  float x_ratio = (float)boundingBoxWidth / targetWidth;
+
+  // Calculate the starting position to center the scaled image
+  int startX = (TARGET_WIDTH - targetWidth) / 2;
+  int startY = (TARGET_HEIGHT - targetHeight) / 2;
+
+  // Initialize output array with zeros
+  for (int i = 0; i < TARGET_WIDTH * TARGET_HEIGHT; ++i) {
+      outputNumber[i] = 0;
   }
-}
 
-void resizeImage(uint16_t *original, uint16_t *resized) {
-  float x_ratio = (float)ORIGINAL_HEIGHT / TARGET_WIDTH;
-  float y_ratio = (float)ORIGINAL_HEIGHT / TARGET_HEIGHT;
-
-  for (int y = 0; y < TARGET_HEIGHT; y++) {
-    for (int x = 0; x < TARGET_WIDTH; x++) {
+  for (int y = 0; y < targetHeight; y++) {
+    for (int x = 0; x < targetWidth; x++) {
       int px = (int)(x * x_ratio);
       int py = (int)(y * y_ratio);
 
-      int originalIndex = (py * ORIGINAL_WIDTH) + px;
-      int resizedIndex = (y * TARGET_WIDTH) + x;
+      int originalIndex = (py * boundingBoxWidth) + px;
+      int resizedIndex = (startY + y) * TARGET_WIDTH + (startX + x);
 
-      resized[resizedIndex] = original[originalIndex];
+      outputNumber[resizedIndex] = inputNumber[originalIndex];
     }
   }
 }
 
-void rgb565ToGreyscale(const uint16_t *rgb565Image, uint16_t *greyscaleImage) {
-  for (int i = 0; i < ORIGINAL_WIDTH * ORIGINAL_HEIGHT; i++) {
-    uint16_t pixel = rgb565Image[i];
+void cropAndResize(uint8_t *inputImage, uint8_t *outputImage) {
+    // Find bounding box around the number
+    int minX = ORIGINAL_WIDTH;
+    int minY = ORIGINAL_HEIGHT;
+    int maxX = 0;
+    int maxY = 0;
 
-    // Extract individual color components
-    uint16_t red = ((pixel >> 11) & 0x1f) << 3;
-    uint16_t green = ((pixel >> 5) & 0x3f) << 2;
-    uint16_t blue = (pixel & 0x1f) << 3;
-    uint16_t greyscale = ((0.2126 * red) + (0.7152 * green) + (0.0722 * blue));
-    
-    greyscaleImage[i] = greyscale;
+    for (int y = 0; y < ORIGINAL_HEIGHT; y++) {
+        for (int x = 0; x < ORIGINAL_WIDTH; x++) {
+            int index = y * ORIGINAL_WIDTH + x;
+            if (inputImage[index] >= UPPER_CONTRAST) {  // Assuming white represents the number
+                // Update bounding box
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+            }
+        }
+    }
+    minX = (minX > 0) ? minX-1 : minX;
+    minY = (minY > 0) ? minY-1 : minY;
+    maxX = (maxX < ORIGINAL_WIDTH) ? maxX+1 : maxX;
+    maxY = (maxY < ORIGINAL_HEIGHT) ? maxY+1 : maxY;
+
+    // Check if bounding box is greater than 28 in either height or width
+    int boundingBoxWidth = maxX - minX + 1;
+    int boundingBoxHeight = maxY - minY + 1;
+    uint8_t number[boundingBoxWidth*boundingBoxHeight];
+
+    for (int i = 0; i < boundingBoxWidth * boundingBoxHeight; ++i) {
+      number[i] = 0;
+    }
+
+    // Crop the image based on the resized bounding box
+    for (int y = minY; y <= minY + boundingBoxHeight - 1; y++) {
+      for (int x = minX; x <= minX + boundingBoxWidth - 1; x++) {
+        int inputIndex = y * ORIGINAL_WIDTH + x;
+        int outputIndex = (y - minY) * boundingBoxWidth + (x - minX);
+
+        // Check if the current pixel value is greater than 250
+        if (inputImage[inputIndex] >= UPPER_CONTRAST) {
+          number[outputIndex] = inputImage[inputIndex];
+        }
+        else  if (inputImage[(y-1) * ORIGINAL_WIDTH + x] >= UPPER_CONTRAST) {
+          number[outputIndex] = inputImage[inputIndex];
+        }
+        else  if (inputImage[(y+1) * ORIGINAL_WIDTH + x] >= UPPER_CONTRAST) {
+          number[outputIndex] = inputImage[inputIndex];
+        }
+        else  if (inputImage[y * ORIGINAL_WIDTH + (x-1)] >= UPPER_CONTRAST) {
+          number[outputIndex] = inputImage[inputIndex];
+        }
+        else  if (inputImage[y * ORIGINAL_WIDTH + (x+1)] >= UPPER_CONTRAST) {
+          number[outputIndex] = inputImage[inputIndex];
+        }
+      }
+    }
+    scaleAndCenter(number, outputImage, boundingBoxWidth, boundingBoxHeight);
+}
+
+void contrastStretching(uint8_t *img) {
+    // Find the minimum and maximum pixel values
+    uint8_t min_val = 255;
+    uint8_t max_val = 0;
+
+    for (int i = 0; i < ORIGINAL_WIDTH*ORIGINAL_HEIGHT; i++) {
+        if (img[i] < min_val) {
+            min_val = img[i];
+        }
+        if (img[i] > max_val) {
+            max_val = img[i];
+        }
+    }
+    // Check for division by zero
+    if (max_val == min_val) {
+        // Avoid division by zero by returning without modification
+        return;
+    }
+
+    // Apply contrast stretching
+    for (int i = 0; i < ORIGINAL_WIDTH*ORIGINAL_HEIGHT; i++) {
+        img[i] = ((img[i] - min_val) * 255) / (max_val - min_val);
+    }
+}
+
+void byteReverse(uint16_t *rgb565Image) {
+  uint16_t pixel;
+  for (int i = 0; i < ORIGINAL_WIDTH * ORIGINAL_HEIGHT; i++) {
+
+    pixel = ((rgb565Image[i]&0xFF)<<8)|(rgb565Image[i]>>8);
+    rgb565Image[i] = pixel;
   }
 }
 
-void normalizeImage(uint16_t *greyscaleImage, float *normalizedImage) {
+void rgb565ToGreyscale(const uint16_t *rgb565Image, uint8_t *greyscaleImage) {
+  for (int i = 0; i < ORIGINAL_WIDTH * ORIGINAL_HEIGHT; i++) {
+    uint16_t pixel = rgb565Image[i];
+
+    // Extract red, green, and blue components
+    uint8_t red = ((pixel >> 11) & 0x1f) << 3;
+    uint8_t green = ((pixel >> 5) & 0x3f) << 2;
+    uint8_t blue = (pixel & 0x1f) << 3;
+    uint8_t grayscale = ((red << 16) + (green << 8) + blue)*255;
+
+    greyscaleImage[i] = grayscale;
+  }
+}
+
+void normalizeImage(uint8_t *greyscaleImage, float *normalizedImage) {
   for (int i = 0; i < TARGET_WIDTH * TARGET_HEIGHT; i++) {
     normalizedImage[i] = greyscaleImage[i] / 255.0f;
   }
 }
 
-void displayImageOnSerial(uint16_t *image, int width, int height) {
+void displayImageOnSerial(uint8_t *image, int width, int height) {
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             // Print a character based on pixel intensity
@@ -107,43 +202,6 @@ int get_prediction_data(size_t offset, size_t length, float *out_ptr) {
   return 0;
 }
 
-/**
- * @brief      Convert RGB565 raw camera buffer to RGB888
- *
- * @param[in]   offset       pixel offset of raw buffer
- * @param[in]   length       number of pixels to convert
- * @param[out]  out_buf      pointer to store output image
- */
-int ei_camera_cutout_get_data(size_t offset, size_t length, float *out_ptr) {
-    size_t pixel_ix = offset * 2; 
-    size_t bytes_left = length;
-    size_t out_ptr_ix = 0;
-
-    // read byte for byte
-    while (bytes_left != 0) {
-        // grab the value and convert to r/g/b
-        uint16_t pixel = (resized_pixels[pixel_ix] << 8) | resized_pixels[pixel_ix+1];
-        uint8_t r, g, b;
-        r = ((pixel >> 11) & 0x1f) << 3;
-        g = ((pixel >> 5) & 0x3f) << 2;
-        b = (pixel & 0x1f) << 3;
-
-        // then convert to out_ptr format
-        float pixel_f = (r << 16) + (g << 8) + b;
-        ei_printf("%.5f",pixel_f);  // Print with four decimal places
-        ei_printf(" ");
-        out_ptr[out_ptr_ix] = pixel_f;
-
-        // and go to the next pixel
-        out_ptr_ix++;
-        pixel_ix+=2;
-        bytes_left--;
-    }
-
-    // and done!
-    return 0;
-}
-
 void predict() {
   // summary of inferencing settings (from model_metadata.h)
   ei_printf("Inferencing settings:\n");
@@ -152,7 +210,7 @@ void predict() {
   ei_printf("\tNo. of classes: %d\n", sizeof(ei_classifier_inferencing_categories) / sizeof(ei_classifier_inferencing_categories[0]));
 
   ei::signal_t signal;
-  signal.total_length = EI_CLASSIFIER_INPUT_WIDTH * EI_CLASSIFIER_INPUT_HEIGHT;
+  signal.total_length = EI_CLASSIFIER_DSP_INPUT_FRAME_SIZE;
   signal.get_data = &get_prediction_data;
 
   // run the impulse: DSP, neural network and the Anomaly algorithm
@@ -178,20 +236,42 @@ void loop() {
     Serial.println("Reading frame");
     Serial.println();
     Camera.readFrame(pixels);
+    byteReverse(pixels);
     rgb565ToGreyscale(pixels, greyscale_pixels);
-    cropImage(greyscale_pixels, cropped_pixels);
-    resizeImage(cropped_pixels, resized_pixels);
+    contrastStretching(greyscale_pixels);
+    cropAndResize(greyscale_pixels, resized_pixels);
     normalizeImage(resized_pixels, normalized_pixels);
 
-    int numPixels = TARGET_WIDTH * TARGET_HEIGHT;
-
+    int numPixels = ORIGINAL_WIDTH * ORIGINAL_HEIGHT;
     for (int i = 0; i < numPixels; i++) {
-      uint16_t p = resized_pixels[i];
+      uint16_t p = pixels[i];
+      Serial.print("0x");
+      if (p < 0x1000) {
+        Serial.print('0');
+      }
 
-      Serial.print(p);  // Print with four decimal places
-      Serial.print(' ');
+      if (p < 0x0100) {
+        Serial.print('0');
+      }
+
+      if (p < 0x0010) {
+        Serial.print('0');
+      }
+
+      Serial.print(p, HEX);  // Print with four decimal places
+      Serial.print(", ");
     }
+    Serial.println();
+    int numPixels2 = TARGET_WIDTH * TARGET_HEIGHT;
+    for (int j = 0; j < numPixels2; j++) {
+      float f = normalized_pixels[j];
+      
+      Serial.print(f, 4);  // Print with four decimal places
+      Serial.print(", ");
+    }
+    Serial.println();
     displayImageOnSerial(resized_pixels, TARGET_WIDTH, TARGET_HEIGHT);
     predict();
+    
   }
 }
